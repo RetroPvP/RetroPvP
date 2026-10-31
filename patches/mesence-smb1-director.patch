@@ -1,0 +1,154 @@
+diff --git a/Libretro/libretro.cpp b/Libretro/libretro.cpp
+index 30a2f49..0bcfb68 100644
+--- a/Libretro/libretro.cpp
++++ b/Libretro/libretro.cpp
+@@ -51,6 +51,7 @@
+ #include "../Utilities/VirtualFile.h"
+ #include "VfsFile.h"
+ #include "../Utilities/UTF8Util.h"
++#include "../BulletBill/BulletBillDirector.h"
+ 
+ #define DEVICE_AUTO               RETRO_DEVICE_JOYPAD
+ #define DEVICE_GAMEPAD            RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 0)
+@@ -86,6 +87,7 @@ static int32_t _audioSampleRate = 44100;
+ #include "MesenDB.inc"
+ 
+ static std::unique_ptr<Emulator> _emu;
++static RetroPvP::BulletBillDirector _bulletBillDirector;
+ // shared_ptr to the console (IConsole interface, may be null until emulator initialized)
+ // Supports all console types: NES, SNES, Gameboy, GBA, PC Engine, SMS, Wonderswan
+ static std::shared_ptr<IConsole> _console;
+@@ -93,1 +94,7 @@
++
++static bool IsDirectorUiVisible()
++{
++	unsigned netplayClientIndex = 0;
++	return !env_cb || !env_cb(RETRO_ENVIRONMENT_GET_NETPLAY_CLIENT_INDEX, &netplayClientIndex) || netplayClientIndex > 0;
++}
+ static bool FolderExists(const string& folder)
+@@ -1610,8 +1618,47 @@ void libretro_probe_inputs(const char* tag)
+ 			if(_keyManager) {
+ 			    consoleIf->GetControlManager()->UpdateInputState();
+ 			}
++			RetroPvP::DirectorInput directorInput;
++			if(_bulletBillDirector.IsEnabled()) {
++				directorInput = RetroPvP::ReadDirectorInput(_savedGetInputState, 1);
++				auto spawnResult = _bulletBillDirector.RunFrame(_emu.get(), consoleIf, directorInput);
++				const auto directorStatus = _bulletBillDirector.GetStatus();
++				switch(spawnResult) {
++				case RetroPvP::SpawnResult::NotInGame:
++					logMessage(RETRO_LOG_INFO, "RetroPvP: spawn ignored (start SMB1 first)\n");
++					break;
++				case RetroPvP::SpawnResult::Paused:
++					logMessage(RETRO_LOG_INFO, "RetroPvP: spawn ignored (game is paused)\n");
++					break;
++				case RetroPvP::SpawnResult::ExistingBullet:
++					logMessage(RETRO_LOG_INFO, "RetroPvP: spawn ignored (a Bullet Bill is already active)\n");
++					break;
++				case RetroPvP::SpawnResult::NoFreeSlot:
++					logMessage(RETRO_LOG_INFO, "RetroPvP: spawn ignored (no free enemy slot)\n");
++					break;
++				case RetroPvP::SpawnResult::Spawned:
++					logMessage(RETRO_LOG_INFO, "RetroPvP: Bullet Bill spawned\n");
++					break;
++				default:
++					break;
++				}
++
++				const bool statusChanged = spawnResult == RetroPvP::SpawnResult::TargetChanged ||
++					spawnResult == RetroPvP::SpawnResult::TakeoverEnabled ||
++					spawnResult == RetroPvP::SpawnResult::TakeoverDisabled ||
++					spawnResult == RetroPvP::SpawnResult::Spawned;
++				if(IsDirectorUiVisible() && env_cb && directorStatus.hasTarget && (statusChanged || (_emu->GetFrameCount() % 90) == 0)) {
++					std::string statusText = std::string(directorStatus.label) + " #" + std::to_string(directorStatus.slot + 1) +
++						(directorStatus.controlled ? ": P2 STEUERT" : ": AUSGEWAEHLT");
++					retro_message message = { statusText.c_str(), 120 };
++					env_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
++				}
++			}
+ 
+ 			consoleIf->RunFrame();
++			if(_bulletBillDirector.IsEnabled()) {
++				_bulletBillDirector.RunPostFrame(consoleIf);
++			}
+ 			// Allow emulator to run pre-frame hooks (UI, stats, etc.)
+ 			_emu->OnBeforeSendFrame();
+ 
+@@ -1632,6 +1679,30 @@ void libretro_probe_inputs(const char* tag)
+ 				uint32_t* src = filter->GetOutputBuffer();
+ 				// Ensure we have valid output before displaying
+ 				if(src) {
++					const auto directorStatus = _bulletBillDirector.GetStatus();
++					if(IsDirectorUiVisible() && directorStatus.hasTarget && outInfo.Width > 0 && outInfo.Height > 0) {
++						const int left = directorStatus.screenX * static_cast<int>(outInfo.Width) / 256;
++						// SMB1's visible Goomba/Bill pixels occupy Y+9 through Y+23.
++						const int top = (directorStatus.screenY + 9) * static_cast<int>(outInfo.Height) / 240;
++						const int right = (directorStatus.screenX + 15) * static_cast<int>(outInfo.Width) / 256;
++						const int bottom = (directorStatus.screenY + 23) * static_cast<int>(outInfo.Height) / 240;
++						const uint32_t markerColor = directorStatus.controlled ? 0x00FFFF00 : 0x0000FFFF;
++						auto putMarkerPixel = [src, &outInfo, markerColor](int x, int y) {
++							if(x >= 0 && y >= 0 && x < static_cast<int>(outInfo.Width) && y < static_cast<int>(outInfo.Height)) {
++								src[static_cast<size_t>(y) * outInfo.Width + static_cast<size_t>(x)] = markerColor;
++							}
++						};
++						for(int offset = 0; offset < 5; ++offset) {
++							for(int side = 0; side < 2; ++side) {
++								const int x = side == 0 ? left + offset : right - offset;
++								const int y = side == 0 ? top + offset : bottom - offset;
++								putMarkerPixel(x, top);
++								putMarkerPixel(x, bottom);
++								putMarkerPixel(left, y);
++								putMarkerPixel(right, y);
++							}
++						}
++					}
+ 					size_t pixels = (size_t)outInfo.Width * (size_t)outInfo.Height;
+ 
+ 					static std::vector<uint32_t> rotBuffer;
+@@ -1711,5 +1781,6 @@
+ 			_emu->Serialize(ss, true, 1);
+ 			std::string out = ss.str();
+ 			if(out.size() > size) return false;
++			memset(data, 0, size);
+ 			memcpy(data, out.data(), out.size());
+ 			return true;
+@@ -2229,6 +2299,7 @@ void libretro_probe_inputs(const char* tag)
+ 
+ 	RETRO_API bool retro_load_game(const struct retro_game_info *game)
+ 	{
++		_bulletBillDirector.Reset();
+ 		logSgbDebugf("retro_load_game called: path=%s", game && game->path ? game->path : "(null)");
+ 		char *saveFolder;
+ 		char *systemFolder;
+@@ -2388,6 +2453,10 @@ void libretro_probe_inputs(const char* tag)
+ 			// Use the generic IConsole interface to support all system types
+ 			auto consoleIf = _emu->GetConsole();
+ 			_console = consoleIf;
++			_bulletBillDirector.OnGameLoaded(_emu.get(), consoleIf);
++			logMessage(RETRO_LOG_INFO, _bulletBillDirector.IsEnabled()
++				? "RetroPvP: supported SMB1 profile active\n"
++				: "RetroPvP: unsupported ROM; director disabled\n");
+ 
+ 			// Disable frame blending for libretro - we want raw frames
+ 			// Post-processing should happen in the frontend
+@@ -2767,6 +2836,7 @@ void libretro_probe_inputs(const char* tag)
+ 
+ 	RETRO_API void retro_unload_game()
+ 	{
++		_bulletBillDirector.Reset();
+ 	}
+ 
+ 	RETRO_API unsigned retro_get_region()
+diff --git a/Makefile.libretro b/Makefile.libretro
+index 525338f..a610d3c 100644
+--- a/Makefile.libretro
++++ b/Makefile.libretro
+@@ -159,7 +159,7 @@ endif
+ CXXFLAGS = -fPIC -Wall --std=c++17 $(MESENFLAGS) -I $(realpath ./) -I $(realpath ./Core) -I $(realpath ./Utilities)
+ CFLAGS = -fPIC -Wall $(MESENFLAGS)
+ 
+-LIBRETROSRC := Libretro/libretro.cpp Libretro/VfsFile.cpp
++LIBRETROSRC := Libretro/libretro.cpp Libretro/VfsFile.cpp $(wildcard BulletBill/*.cpp)
+ LIBRETROOBJ := $(LIBRETROSRC:.cpp=.o)
+ 
+ CORESRC := $(shell find Core -name '*.cpp')

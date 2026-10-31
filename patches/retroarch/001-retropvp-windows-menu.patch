@@ -1,0 +1,1100 @@
+diff --git a/network/netplay/netplay_frontend.c b/network/netplay/netplay_frontend.c
+--- a/network/netplay/netplay_frontend.c
++++ b/network/netplay/netplay_frontend.c
+@@ -7980,6 +7980,7 @@ static bool get_self_input_state(
+ {
+    unsigned i;
+    struct delta_frame *ptr        = &netplay->buffer[netplay->self_ptr];
++   struct retro_system_info *system = &runloop_state_get_ptr()->system.info;
+    netplay_input_state_t istate   = NULL;
+    uint32_t devices, used_devices = 0, devi, dev_type, local_device;
+    NETPLAY_ASSERT_MODUS(NETPLAY_MODUS_INPUT_FRAME_SYNC);
+@@ -8012,5 +8013,14 @@ static bool get_self_input_state(
+       if (local_device == MAX_INPUT_DEVICES)
+          local_device = 0;
++
++      /* RetroPvP's director controls are configured as local input port 2.
++       * Netplay normally maps a single client port to local port 1, so use
++       * the matching local P2 bindings for RetroPvP's second game port. */
++      if (!netplay->is_server && devi == 1 && system->library_name
++            && string_is_equal_case_insensitive(system->library_name, "Mesen2")
++            && !(used_devices & (1 << 1))
++            && ((netplay->config_devices[1] & RETRO_DEVICE_MASK) == dev_type))
++         local_device = 1;
+       used_devices |= (1 << local_device);
+ 
+       istate = netplay_input_state_for(&ptr->real_input[devi],
+@@ -9580,5 +9580,12 @@ bool netplay_driver_ctl(enum rarch_netplay_ctl_state state, void *data)
+       case RARCH_NETPLAY_CTL_IS_DATA_INITED:
+          ret = (netplay != NULL);
+          break;
+ 
++      case RARCH_NETPLAY_CTL_GET_CLIENT_INDEX:
++         if (!netplay || !data)
++            ret = false;
++         else
++            *(unsigned *)data = netplay->self_client_num;
++         break;
++
+       case RARCH_NETPLAY_CTL_IS_REPLAYING:
+diff --git a/network/netplay/netplay_defines.h b/network/netplay/netplay_defines.h
+--- a/network/netplay/netplay_defines.h
++++ b/network/netplay/netplay_defines.h
+@@ -77,5 +77,6 @@ enum rarch_netplay_ctl_state
+    RARCH_NETPLAY_CTL_BAN_CLIENT,
+    RARCH_NETPLAY_CTL_SET_CORE_PACKET_INTERFACE,
+    RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE,
+-   RARCH_NETPLAY_CTL_ALLOW_TIMESKIP
++   RARCH_NETPLAY_CTL_ALLOW_TIMESKIP,
++   RARCH_NETPLAY_CTL_GET_CLIENT_INDEX
+ };
+diff --git a/libretro-common/include/libretro.h b/libretro-common/include/libretro.h
+--- a/libretro-common/include/libretro.h
++++ b/libretro-common/include/libretro.h
+@@ -2588,0 +2589,2 @@
++/* Returns the local netplay client index via unsigned *: 0=host, values above 0=clients. */
++#define RETRO_ENVIRONMENT_GET_NETPLAY_CLIENT_INDEX (82 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+diff --git a/runloop.c b/runloop.c
+--- a/runloop.c
++++ b/runloop.c
+@@ -3338,4 +3338,8 @@
+          break;
+       }
+ 
++      case RETRO_ENVIRONMENT_GET_NETPLAY_CLIENT_INDEX:
++         if (!netplay_driver_ctl(RARCH_NETPLAY_CTL_GET_CLIENT_INDEX, data))
++            return false;
++         break;
+       case RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE:
+diff --git a/gfx/common/win32_common.c b/gfx/common/win32_common.c
+index 916672b..63f7ccc 100644
+--- a/gfx/common/win32_common.c
++++ b/gfx/common/win32_common.c
+@@ -60,6 +60,11 @@
+ #include <commdlg.h>
+ #include <dbt.h>
+ #include "../../input/input_keymaps.h"
++#include "../../input/input_driver.h"
++#include "../../audio/audio_driver.h"
++#ifdef HAVE_NETWORKING
++#include "../../network/netplay/netplay.h"
++#endif
+ #include <shellapi.h>
+ 
+ #ifdef HAVE_MENU
+@@ -711,6 +715,713 @@ static bool win32_browser(
+    return result;
+ }
+ 
++#define RETROPVP_BIND_COUNT 11
++#define RETROPVP_HOTKEY_COUNT 11
++
++typedef struct retropvp_key_dialog_state
++{
++   HWND dialog;
++   unsigned port;
++   bool hotkeys;
++   int active_control;
++   unsigned active_bind;
++   enum retro_key original[RARCH_BIND_LIST_END];
++} retropvp_key_dialog_state_t;
++
++static HHOOK retropvp_keyboard_hook;
++static retropvp_key_dialog_state_t *retropvp_active_key_dialog;
++
++static unsigned retropvp_bind_id_from_control(int control)
++{
++   switch (control)
++   {
++      case IDC_RETROPVP_BIND_UP:
++         return RETRO_DEVICE_ID_JOYPAD_UP;
++      case IDC_RETROPVP_BIND_DOWN:
++         return RETRO_DEVICE_ID_JOYPAD_DOWN;
++      case IDC_RETROPVP_BIND_LEFT:
++         return RETRO_DEVICE_ID_JOYPAD_LEFT;
++      case IDC_RETROPVP_BIND_RIGHT:
++         return RETRO_DEVICE_ID_JOYPAD_RIGHT;
++      case IDC_RETROPVP_BIND_A:
++         return RETRO_DEVICE_ID_JOYPAD_A;
++      case IDC_RETROPVP_BIND_B:
++         return RETRO_DEVICE_ID_JOYPAD_B;
++      case IDC_RETROPVP_BIND_START:
++         return RETRO_DEVICE_ID_JOYPAD_START;
++      case IDC_RETROPVP_BIND_SELECT:
++         return RETRO_DEVICE_ID_JOYPAD_SELECT;
++      case IDC_RETROPVP_BIND_L:
++         return RETRO_DEVICE_ID_JOYPAD_L;
++      case IDC_RETROPVP_BIND_R:
++         return RETRO_DEVICE_ID_JOYPAD_R;
++      case IDC_RETROPVP_BIND_X:
++         return RETRO_DEVICE_ID_JOYPAD_X;
++      case IDC_RETROPVP_HOTKEY_MENU:
++         return RARCH_MENU_TOGGLE;
++      case IDC_RETROPVP_HOTKEY_PAUSE:
++         return RARCH_PAUSE_TOGGLE;
++      case IDC_RETROPVP_HOTKEY_SAVE:
++         return RARCH_SAVE_STATE_KEY;
++      case IDC_RETROPVP_HOTKEY_LOAD:
++         return RARCH_LOAD_STATE_KEY;
++      case IDC_RETROPVP_HOTKEY_SLOT_PREV:
++         return RARCH_STATE_SLOT_MINUS;
++      case IDC_RETROPVP_HOTKEY_SLOT_NEXT:
++         return RARCH_STATE_SLOT_PLUS;
++      case IDC_RETROPVP_HOTKEY_SCREENSHOT:
++         return RARCH_SCREENSHOT;
++      case IDC_RETROPVP_HOTKEY_RESET:
++         return RARCH_RESET;
++      case IDC_RETROPVP_HOTKEY_MUTE:
++         return RARCH_MUTE;
++      case IDC_RETROPVP_HOTKEY_FULLSCREEN:
++         return RARCH_FULLSCREEN_TOGGLE_KEY;
++      case IDC_RETROPVP_HOTKEY_QUIT:
++         return RARCH_QUIT_KEY;
++      default:
++         break;
++   }
++
++   return RARCH_BIND_LIST_END;
++}
++
++static void retropvp_set_bind_label(HWND dialog, int control,
++      enum retro_key key)
++{
++   char label[64];
++
++   if (key == RETROK_UNKNOWN)
++      strlcpy(label, "None", sizeof(label));
++   else
++      input_keymaps_translate_rk_to_str(key, label, sizeof(label));
++
++   SetDlgItemTextA(dialog, control, label);
++}
++
++static void retropvp_stop_key_capture(void)
++{
++   if (retropvp_keyboard_hook)
++   {
++      UnhookWindowsHookEx(retropvp_keyboard_hook);
++      retropvp_keyboard_hook = NULL;
++   }
++   retropvp_active_key_dialog = NULL;
++}
++
++static LRESULT CALLBACK retropvp_keyboard_hook_proc(
++      int code, WPARAM wparam, LPARAM lparam)
++{
++   retropvp_key_dialog_state_t *state = retropvp_active_key_dialog;
++
++   if (code == HC_ACTION && state && state->active_control
++         && !(lparam & 0x80000000))
++   {
++      enum retro_key key = RETROK_UNKNOWN;
++      unsigned scan = (unsigned)((lparam >> 16) & 0xFF);
++
++      if (wparam == VK_DELETE)
++         key = RETROK_UNKNOWN;
++      else
++      {
++         if (lparam & 0x01000000)
++            scan |= 0xE000;
++         if (!scan)
++            scan = MapVirtualKeyA((UINT)wparam, MAPVK_VK_TO_VSC);
++         key = input_keymaps_translate_keysym_to_rk(scan);
++      }
++
++      if (key != RETROK_UNKNOWN || wparam == VK_DELETE)
++      {
++         HWND dialog = state->dialog;
++         input_config_binds[state->port][state->active_bind].key = key;
++         retropvp_set_bind_label(dialog, state->active_control, key);
++         state->active_control = 0;
++         retropvp_stop_key_capture();
++         return 1;
++      }
++
++      return 1;
++   }
++
++   return CallNextHookEx(retropvp_keyboard_hook, code, wparam, lparam);
++}
++
++static INT_PTR CALLBACK retropvp_key_dialog_proc(HWND dialog,
++      UINT message, WPARAM wparam, LPARAM lparam)
++{
++   retropvp_key_dialog_state_t *state = (retropvp_key_dialog_state_t*)
++      GetWindowLongPtrA(dialog, DWLP_USER);
++
++   if (message == WM_INITDIALOG)
++   {
++      unsigned i;
++      static const int game_controls[RETROPVP_BIND_COUNT] = {
++         IDC_RETROPVP_BIND_UP,
++         IDC_RETROPVP_BIND_DOWN,
++         IDC_RETROPVP_BIND_LEFT,
++         IDC_RETROPVP_BIND_RIGHT,
++         IDC_RETROPVP_BIND_A,
++         IDC_RETROPVP_BIND_B,
++         IDC_RETROPVP_BIND_START,
++         IDC_RETROPVP_BIND_SELECT,
++         IDC_RETROPVP_BIND_L,
++         IDC_RETROPVP_BIND_R,
++         IDC_RETROPVP_BIND_X
++      };
++      static const int hotkey_controls[RETROPVP_HOTKEY_COUNT] = {
++         IDC_RETROPVP_HOTKEY_MENU,
++         IDC_RETROPVP_HOTKEY_PAUSE,
++         IDC_RETROPVP_HOTKEY_SAVE,
++         IDC_RETROPVP_HOTKEY_LOAD,
++         IDC_RETROPVP_HOTKEY_SLOT_PREV,
++         IDC_RETROPVP_HOTKEY_SLOT_NEXT,
++         IDC_RETROPVP_HOTKEY_SCREENSHOT,
++         IDC_RETROPVP_HOTKEY_RESET,
++         IDC_RETROPVP_HOTKEY_MUTE,
++         IDC_RETROPVP_HOTKEY_FULLSCREEN,
++         IDC_RETROPVP_HOTKEY_QUIT
++      };
++      const int *controls;
++      unsigned control_count;
++
++      state = (retropvp_key_dialog_state_t*)lparam;
++      state->dialog = dialog;
++      SetWindowLongPtrA(dialog, DWLP_USER, (LONG_PTR)state);
++      controls = state->hotkeys ? hotkey_controls : game_controls;
++      control_count = state->hotkeys
++         ? RETROPVP_HOTKEY_COUNT : RETROPVP_BIND_COUNT;
++      for (i = 0; i < RARCH_BIND_LIST_END; i++)
++         state->original[i] = input_config_binds[state->port][i].key;
++
++      for (i = 0; i < control_count; i++)
++      {
++         unsigned bind_id = retropvp_bind_id_from_control(controls[i]);
++         if (bind_id < RARCH_BIND_LIST_END
++               && GetDlgItem(dialog, controls[i]))
++            retropvp_set_bind_label(dialog, controls[i],
++                  input_config_binds[state->port][bind_id].key);
++      }
++
++      return TRUE;
++   }
++
++   if (!state)
++      return FALSE;
++
++   switch (message)
++   {
++      case WM_COMMAND:
++         {
++            unsigned bind_id = retropvp_bind_id_from_control(LOWORD(wparam));
++            if (HIWORD(wparam) == BN_CLICKED
++                  && bind_id < RARCH_BIND_LIST_END)
++            {
++               if (state->active_control)
++                  retropvp_set_bind_label(dialog, state->active_control,
++                        input_config_binds[state->port][state->active_bind].key);
++               retropvp_stop_key_capture();
++               state->active_control = LOWORD(wparam);
++               state->active_bind    = bind_id;
++               retropvp_active_key_dialog = state;
++               retropvp_keyboard_hook = SetWindowsHookExA(
++                     WH_KEYBOARD, retropvp_keyboard_hook_proc, NULL,
++                     GetCurrentThreadId());
++               if (retropvp_keyboard_hook)
++                  SetDlgItemTextA(dialog, state->active_control, "Press key...");
++               else
++               {
++                  state->active_control = 0;
++                  MessageBoxA(dialog, "Could not capture keyboard input.",
++                        "RetroPvP", MB_OK | MB_ICONERROR);
++               }
++               return TRUE;
++            }
++
++            if (LOWORD(wparam) == IDOK)
++            {
++               retropvp_stop_key_capture();
++               state->active_control = 0;
++               if (command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL))
++                  EndDialog(dialog, IDOK);
++               else
++                  MessageBoxA(dialog, "Could not save key bindings.",
++                        "RetroPvP", MB_OK | MB_ICONERROR);
++               return TRUE;
++            }
++
++            if (LOWORD(wparam) == IDCANCEL)
++            {
++               unsigned i;
++               retropvp_stop_key_capture();
++               for (i = 0; i < RARCH_BIND_LIST_END; i++)
++                  input_config_binds[state->port][i].key = state->original[i];
++               EndDialog(dialog, IDCANCEL);
++               return TRUE;
++            }
++         }
++         break;
++      case WM_CLOSE:
++         {
++            unsigned i;
++            retropvp_stop_key_capture();
++            for (i = 0; i < RARCH_BIND_LIST_END; i++)
++               input_config_binds[state->port][i].key = state->original[i];
++            EndDialog(dialog, IDCANCEL);
++         }
++         return TRUE;
++      default:
++         break;
++   }
++
++   return FALSE;
++}
++
++typedef struct retropvp_volume_dialog_state
++{
++   float original_volume;
++   int current_volume;
++} retropvp_volume_dialog_state_t;
++
++static void retropvp_apply_volume(HWND dialog, int volume)
++{
++   settings_t *settings = config_get_ptr();
++   char label[32];
++
++   if (volume < -80)
++      volume = -80;
++   if (volume > 12)
++      volume = 12;
++
++   settings->floats.audio_volume = (float)volume;
++   audio_set_float(AUDIO_ACTION_VOLUME_GAIN, (float)volume);
++   snprintf(label, sizeof(label), "%d dB", volume);
++   SetDlgItemTextA(dialog, IDC_RETROPVP_VOLUME_VALUE, label);
++   SetScrollPos(GetDlgItem(dialog, IDC_RETROPVP_VOLUME_SLIDER),
++         SB_CTL, volume, TRUE);
++}
++
++static INT_PTR CALLBACK retropvp_volume_dialog_proc(HWND dialog,
++      UINT message, WPARAM wparam, LPARAM lparam)
++{
++   retropvp_volume_dialog_state_t *state = (retropvp_volume_dialog_state_t*)
++      GetWindowLongPtrA(dialog, DWLP_USER);
++
++   if (message == WM_INITDIALOG)
++   {
++      settings_t *settings = config_get_ptr();
++      SCROLLINFO info;
++      int volume = (int)settings->floats.audio_volume;
++      state = (retropvp_volume_dialog_state_t*)lparam;
++      state->original_volume = settings->floats.audio_volume;
++      if (settings->floats.audio_volume < 0.0f
++            && settings->floats.audio_volume != (float)volume)
++         volume--;
++      state->current_volume = volume;
++      SetWindowLongPtrA(dialog, DWLP_USER, (LONG_PTR)state);
++      memset(&info, 0, sizeof(info));
++      info.cbSize = sizeof(info);
++      info.fMask = SIF_RANGE | SIF_POS;
++      info.nMin = -80;
++      info.nMax = 12;
++      info.nPos = volume;
++      SetScrollInfo(GetDlgItem(dialog, IDC_RETROPVP_VOLUME_SLIDER),
++            SB_CTL, &info, TRUE);
++      retropvp_apply_volume(dialog, volume);
++      return TRUE;
++   }
++
++   if (!state)
++      return FALSE;
++
++   if (message == WM_HSCROLL)
++   {
++      int volume = state->current_volume;
++      SCROLLINFO info;
++      memset(&info, 0, sizeof(info));
++      info.cbSize = sizeof(info);
++      info.fMask = SIF_TRACKPOS;
++      switch (LOWORD(wparam))
++      {
++         case SB_LINELEFT:   volume--; break;
++         case SB_LINERIGHT:  volume++; break;
++         case SB_PAGELEFT:   volume -= 6; break;
++         case SB_PAGERIGHT:  volume += 6; break;
++         case SB_TOP:        volume = -80; break;
++         case SB_BOTTOM:     volume = 12; break;
++         case SB_THUMBPOSITION:
++         case SB_THUMBTRACK:
++            GetScrollInfo((HWND)lparam, SB_CTL, &info);
++            volume = info.nTrackPos;
++            break;
++         default:
++            return TRUE;
++      }
++      state->current_volume = volume;
++      retropvp_apply_volume(dialog, volume);
++      return TRUE;
++   }
++
++   if (message == WM_COMMAND)
++   {
++      if (LOWORD(wparam) == IDOK)
++      {
++         if (command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL))
++            EndDialog(dialog, IDOK);
++         else
++            MessageBoxA(dialog, "Could not save volume setting.",
++                  "RetroPvP", MB_OK | MB_ICONERROR);
++         return TRUE;
++      }
++      if (LOWORD(wparam) == IDCANCEL)
++      {
++         settings_t *settings = config_get_ptr();
++         settings->floats.audio_volume = state->original_volume;
++         audio_set_float(AUDIO_ACTION_VOLUME_GAIN, state->original_volume);
++         EndDialog(dialog, IDCANCEL);
++         return TRUE;
++      }
++   }
++
++   if (message == WM_CLOSE)
++   {
++      settings_t *settings = config_get_ptr();
++      settings->floats.audio_volume = state->original_volume;
++      audio_set_float(AUDIO_ACTION_VOLUME_GAIN, state->original_volume);
++      EndDialog(dialog, IDCANCEL);
++      return TRUE;
++   }
++
++   return FALSE;
++}
++
++#ifdef HAVE_NETWORKING
++static char retropvp_netplay_address[512];
++
++static void retropvp_update_relay_custom(HWND dialog)
++{
++   LRESULT selection = SendDlgItemMessageA(dialog,
++         IDC_RETROPVP_RELAY_REGION, CB_GETCURSEL, 0, 0);
++   EnableWindow(GetDlgItem(dialog, IDC_RETROPVP_RELAY_CUSTOM),
++         selection == 4);
++}
++
++static INT_PTR CALLBACK retropvp_relay_dialog_proc(HWND dialog,
++      UINT message, WPARAM wparam, LPARAM lparam)
++{
++   static const char *server_ids[] = {
++      "nyc", "madrid", "saopaulo", "singapore", "custom"
++   };
++   static const char *server_labels[] = {
++      "New York", "Western Europe (Madrid)",
++      "Southeast Brazil", "Southeast Asia", "Custom"
++   };
++
++   if (message == WM_INITDIALOG)
++   {
++      settings_t *settings = config_get_ptr();
++      unsigned i;
++      int selection = 4;
++      for (i = 0; i < sizeof(server_ids) / sizeof(server_ids[0]); i++)
++      {
++         SendDlgItemMessageA(dialog, IDC_RETROPVP_RELAY_REGION,
++               CB_ADDSTRING, 0, (LPARAM)server_labels[i]);
++         if (strcmp(settings->arrays.netplay_mitm_server, server_ids[i]) == 0)
++            selection = (int)i;
++      }
++      SendDlgItemMessageA(dialog, IDC_RETROPVP_RELAY_REGION,
++            CB_SETCURSEL, selection, 0);
++      SetDlgItemTextA(dialog, IDC_RETROPVP_RELAY_CUSTOM,
++            settings->paths.netplay_custom_mitm_server);
++      retropvp_update_relay_custom(dialog);
++      return TRUE;
++   }
++
++   if (message == WM_COMMAND)
++   {
++      if (LOWORD(wparam) == IDC_RETROPVP_RELAY_REGION
++            && HIWORD(wparam) == CBN_SELCHANGE)
++      {
++         retropvp_update_relay_custom(dialog);
++         return TRUE;
++      }
++      if (LOWORD(wparam) == IDOK)
++      {
++         settings_t *settings = config_get_ptr();
++         int selection = (int)SendDlgItemMessageA(dialog,
++               IDC_RETROPVP_RELAY_REGION, CB_GETCURSEL, 0, 0);
++         char custom[256];
++         char old_server[sizeof(settings->arrays.netplay_mitm_server)];
++         char old_custom[sizeof(settings->paths.netplay_custom_mitm_server)];
++         if (selection < 0 || selection >=
++               (int)(sizeof(server_ids) / sizeof(server_ids[0])))
++            return TRUE;
++         GetDlgItemTextA(dialog, IDC_RETROPVP_RELAY_CUSTOM,
++               custom, sizeof(custom));
++         if (selection == 4 && !custom[0])
++         {
++            MessageBoxA(dialog, "Enter a custom relay address.",
++                  "RetroPvP", MB_OK | MB_ICONINFORMATION);
++            return TRUE;
++         }
++         strlcpy(old_server, settings->arrays.netplay_mitm_server,
++               sizeof(old_server));
++         strlcpy(old_custom, settings->paths.netplay_custom_mitm_server,
++               sizeof(old_custom));
++         strlcpy(settings->arrays.netplay_mitm_server,
++               server_ids[selection],
++               sizeof(settings->arrays.netplay_mitm_server));
++         strlcpy(settings->paths.netplay_custom_mitm_server, custom,
++               sizeof(settings->paths.netplay_custom_mitm_server));
++         if (command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL))
++            EndDialog(dialog, IDOK);
++         else
++         {
++            strlcpy(settings->arrays.netplay_mitm_server, old_server,
++                  sizeof(settings->arrays.netplay_mitm_server));
++            strlcpy(settings->paths.netplay_custom_mitm_server, old_custom,
++                  sizeof(settings->paths.netplay_custom_mitm_server));
++            MessageBoxA(dialog, "Could not save relay setting.",
++                  "RetroPvP", MB_OK | MB_ICONERROR);
++         }
++         return TRUE;
++      }
++      if (LOWORD(wparam) == IDCANCEL)
++      {
++         EndDialog(dialog, IDCANCEL);
++         return TRUE;
++      }
++   }
++
++   if (message == WM_CLOSE)
++   {
++      EndDialog(dialog, IDCANCEL);
++      return TRUE;
++   }
++
++   return FALSE;
++}
++
++static INT_PTR CALLBACK retropvp_connect_dialog_proc(HWND dialog,
++      UINT message, WPARAM wparam, LPARAM lparam)
++{
++   if (message == WM_INITDIALOG)
++   {
++      retropvp_netplay_address[0] = '\0';
++      SetFocus(GetDlgItem(dialog, IDC_RETROPVP_ADDRESS));
++      return FALSE;
++   }
++
++   if (message == WM_COMMAND)
++   {
++      if (LOWORD(wparam) == IDOK)
++      {
++         GetDlgItemTextA(dialog, IDC_RETROPVP_ADDRESS,
++               retropvp_netplay_address,
++               sizeof(retropvp_netplay_address));
++         if (retropvp_netplay_address[0])
++            EndDialog(dialog, IDOK);
++         else
++            MessageBoxA(dialog, "Enter a host address.", "RetroPvP",
++                  MB_OK | MB_ICONINFORMATION);
++         return TRUE;
++      }
++      if (LOWORD(wparam) == IDCANCEL)
++      {
++         EndDialog(dialog, IDCANCEL);
++         return TRUE;
++      }
++   }
++
++   return FALSE;
++}
++
++static bool retropvp_connect_to_host(void)
++{
++   bool success = false;
++
++   if (netplay_driver_ctl(RARCH_NETPLAY_CTL_USE_CORE_PACKET_INTERFACE, NULL))
++   {
++      netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
++      success = command_event(CMD_EVENT_NETPLAY_INIT_DIRECT,
++            (void*)retropvp_netplay_address);
++   }
++   else if (task_push_netplay_content_reload(retropvp_netplay_address))
++      success = true;
++   else
++   {
++#ifdef HAVE_DYNAMIC
++      command_event(CMD_EVENT_NETPLAY_DEINIT, NULL);
++      netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
++      success = command_event(CMD_EVENT_NETPLAY_INIT_DIRECT_DEFERRED,
++            (void*)retropvp_netplay_address);
++#endif
++   }
++
++   if (!success)
++      RARCH_ERR("[RetroPvP] Could not start a connection to the host.\n");
++   return success;
++}
++
++static bool retropvp_write_host_mode_config(bool use_relay)
++{
++   const char *append_path = path_get(RARCH_PATH_CONFIG_APPEND);
++   config_file_t *config;
++   bool saved;
++
++   /* The RetroPvP launcher supplies one project-local append config. */
++   if (string_is_empty(append_path))
++      return false;
++
++   config = config_file_new(append_path);
++   if (!config)
++      return false;
++
++   config_set_string(config, "netplay_use_mitm_server",
++         use_relay ? "true" : "false");
++   config_set_string(config, "netplay_nat_traversal",
++         use_relay ? "false" : "true");
++   saved = config_file_write(config, append_path, true);
++   config_file_free(config);
++   return saved;
++}
++
++static bool retropvp_start_host(HWND owner, bool use_relay)
++{
++   settings_t *settings = config_get_ptr();
++
++   if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL))
++   {
++      MessageBoxA(owner, "Disconnect from the current session first.",
++            "RetroPvP", MB_OK | MB_ICONINFORMATION);
++      return false;
++   }
++
++   if (!retropvp_write_host_mode_config(use_relay))
++   {
++      MessageBoxA(owner,
++            "Could not save the host mode for the SMB1 reload.",
++            "RetroPvP", MB_OK | MB_ICONERROR);
++      return false;
++   }
++
++   settings->bools.netplay_use_mitm_server = use_relay;
++   settings->bools.netplay_nat_traversal  = !use_relay;
++
++   if (!command_event(CMD_EVENT_NETPLAY_ENABLE_HOST, NULL))
++   {
++      MessageBoxA(owner, use_relay ? "Could not start relay hosting." :
++            "Could not start direct hosting.", "RetroPvP",
++            MB_OK | MB_ICONERROR);
++      return false;
++   }
++
++   return true;
++}
++
++static bool retropvp_copy_host_address(HWND owner)
++{
++   net_driver_state_t *net_st;
++   struct nat_traversal_data *nat;
++   char host[256];
++   char port[6];
++   char endpoint[512];
++   char message[600];
++   HGLOBAL clipboard_data;
++   char *clipboard_text;
++   size_t text_size;
++
++   if (!netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
++         || !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_SERVER, NULL))
++   {
++      MessageBoxA(owner, "Start hosting first.", "RetroPvP",
++            MB_OK | MB_ICONINFORMATION);
++      return false;
++   }
++
++   net_st = networking_state_get_ptr();
++   if (!string_is_empty(net_st->host_room.mitm_session)
++         && !string_is_empty(net_st->host_room.mitm_address)
++         && net_st->host_room.mitm_port > 0)
++      snprintf(endpoint, sizeof(endpoint), "%s|%d|%s",
++            net_st->host_room.mitm_address, net_st->host_room.mitm_port,
++            net_st->host_room.mitm_session);
++   else
++   {
++      nat = &net_st->nat_traversal_request;
++      if (nat->status != NAT_TRAVERSAL_STATUS_OPENED
++            || nat->request.addr.sin_family != AF_INET
++            || !nat->request.addr.sin_port)
++      {
++         MessageBoxA(owner,
++               "No public host address or relay invite is available yet.",
++               "RetroPvP", MB_OK | MB_ICONINFORMATION);
++         return false;
++      }
++
++      if (ipv4_is_cgnat_address(&nat->request.addr)
++            || ipv4_is_lan_address(&nat->request.addr))
++      {
++         MessageBoxA(owner,
++               "The mapped address is not reachable from the internet.",
++               "RetroPvP", MB_OK | MB_ICONINFORMATION);
++         return false;
++      }
++
++      if (getnameinfo_retro((struct sockaddr*)&nat->request.addr,
++               sizeof(nat->request.addr), host, sizeof(host), port,
++               sizeof(port), NI_NUMERICHOST | NI_NUMERICSERV))
++      {
++         MessageBoxA(owner, "Could not read the host address.", "RetroPvP",
++               MB_OK | MB_ICONERROR);
++         return false;
++      }
++
++      snprintf(endpoint, sizeof(endpoint), "%s|%s", host, port);
++   }
++   text_size = strlen(endpoint) + 1;
++   clipboard_data = GlobalAlloc(GMEM_MOVEABLE, text_size);
++   if (!clipboard_data)
++   {
++      MessageBoxA(owner, "Could not copy the host address.", "RetroPvP",
++            MB_OK | MB_ICONERROR);
++      return false;
++   }
++
++   clipboard_text = (char*)GlobalLock(clipboard_data);
++   if (!clipboard_text)
++   {
++      GlobalFree(clipboard_data);
++      MessageBoxA(owner, "Could not copy the host address.", "RetroPvP",
++            MB_OK | MB_ICONERROR);
++      return false;
++   }
++   memcpy(clipboard_text, endpoint, text_size);
++   GlobalUnlock(clipboard_data);
++
++   if (!OpenClipboard(owner))
++   {
++      GlobalFree(clipboard_data);
++      MessageBoxA(owner, "Could not access the clipboard.", "RetroPvP",
++            MB_OK | MB_ICONERROR);
++      return false;
++   }
++   if (!EmptyClipboard() || !SetClipboardData(CF_TEXT, clipboard_data))
++   {
++      CloseClipboard();
++      GlobalFree(clipboard_data);
++      MessageBoxA(owner, "Could not copy the host address.", "RetroPvP",
++            MB_OK | MB_ICONERROR);
++      return false;
++   }
++   CloseClipboard();
++
++   snprintf(message, sizeof(message), "Copied join address:\r\n%s", endpoint);
++   MessageBoxA(owner, message, "RetroPvP", MB_OK | MB_ICONINFORMATION);
++   return true;
++}
++#endif
++
+ static LRESULT win32_menu_loop(HWND owner, WPARAM wparam)
+ {
+    WPARAM mode            = wparam & 0xffff;
+@@ -853,6 +1225,90 @@ static LRESULT win32_menu_loop(HWND owner, WPARAM wparam)
+       case ID_M_TOGGLE_DESKTOP:
+          command_event(CMD_EVENT_UI_COMPANION_TOGGLE, NULL);
+          break;
++      case ID_M_RETROPVP_HOST:
++#ifdef HAVE_NETWORKING
++         retropvp_start_host(owner, false);
++#else
++         MessageBoxA(owner, "Networking is not available in this build.",
++               "RetroPvP", MB_OK | MB_ICONERROR);
++#endif
++         break;
++      case ID_M_RETROPVP_HOST_RELAY:
++#ifdef HAVE_NETWORKING
++         retropvp_start_host(owner, true);
++#else
++         MessageBoxA(owner, "Networking is not available in this build.",
++               "RetroPvP", MB_OK | MB_ICONERROR);
++#endif
++         break;
++      case ID_M_RETROPVP_COPY_HOST_ADDRESS:
++#ifdef HAVE_NETWORKING
++         retropvp_copy_host_address(owner);
++#else
++         MessageBoxA(owner, "Networking is not available in this build.",
++               "RetroPvP", MB_OK | MB_ICONERROR);
++#endif
++         break;
++      case ID_M_RETROPVP_JOIN:
++#ifdef HAVE_NETWORKING
++         if (DialogBoxParamA(GetModuleHandleA(NULL),
++                  MAKEINTRESOURCEA(IDD_RETROPVP_CONNECT), owner,
++                  retropvp_connect_dialog_proc, 0) == IDOK
++               && !retropvp_connect_to_host())
++            MessageBoxA(owner, "Could not connect to the host.", "RetroPvP",
++                  MB_OK | MB_ICONERROR);
++#else
++         MessageBoxA(owner, "Networking is not available in this build.",
++               "RetroPvP", MB_OK | MB_ICONERROR);
++#endif
++         break;
++      case ID_M_RETROPVP_DISCONNECT:
++#ifdef HAVE_NETWORKING
++         command_event(CMD_EVENT_NETPLAY_DISCONNECT, NULL);
++#endif
++         break;
++      case ID_M_RETROPVP_P1_KEYS:
++      case ID_M_RETROPVP_P2_KEYS:
++         {
++            retropvp_key_dialog_state_t state;
++            memset(&state, 0, sizeof(state));
++            state.port = mode == ID_M_RETROPVP_P1_KEYS ? 0 : 1;
++            DialogBoxParamA(GetModuleHandleA(NULL),
++                  MAKEINTRESOURCEA(state.port == 0
++                     ? IDD_RETROPVP_P1_KEYS : IDD_RETROPVP_P2_KEYS),
++                  owner, retropvp_key_dialog_proc, (LPARAM)&state);
++         }
++         break;
++      case ID_M_RETROPVP_HOTKEYS:
++         {
++            retropvp_key_dialog_state_t state;
++            memset(&state, 0, sizeof(state));
++            state.port = 0;
++            state.hotkeys = true;
++            DialogBoxParamA(GetModuleHandleA(NULL),
++                  MAKEINTRESOURCEA(IDD_RETROPVP_HOTKEYS), owner,
++                  retropvp_key_dialog_proc, (LPARAM)&state);
++         }
++         break;
++      case ID_M_RETROPVP_VOLUME:
++         {
++            retropvp_volume_dialog_state_t state;
++            memset(&state, 0, sizeof(state));
++            DialogBoxParamA(GetModuleHandleA(NULL),
++                  MAKEINTRESOURCEA(IDD_RETROPVP_VOLUME), owner,
++                  retropvp_volume_dialog_proc, (LPARAM)&state);
++         }
++         break;
++      case ID_M_RETROPVP_RELAY:
++#ifdef HAVE_NETWORKING
++         DialogBoxParamA(GetModuleHandleA(NULL),
++               MAKEINTRESOURCEA(IDD_RETROPVP_RELAY), owner,
++               retropvp_relay_dialog_proc, 0);
++#else
++         MessageBoxA(owner, "Networking is not available in this build.",
++               "RetroPvP", MB_OK | MB_ICONERROR);
++#endif
++         break;
+       default:
+          if (mode >= ID_M_WINDOW_SCALE_1X && mode <= ID_M_WINDOW_SCALE_10X)
+          {
+diff --git a/media/rarch.rc b/media/rarch.rc
+index 02867a4..f4124d3 100644
+--- a/media/rarch.rc
++++ b/media/rarch.rc
+@@ -53,6 +53,20 @@ IDR_MENU MENU
+         MENUITEM "Take Screenshot", ID_M_TAKE_SCREENSHOT
+         MENUITEM "Mouse Grab Toggle", ID_M_MOUSE_GRAB
+     }
++    POPUP "RetroPvP"
++    {
++        MENUITEM "Host Directly", ID_M_RETROPVP_HOST
++        MENUITEM "Host via Relay", ID_M_RETROPVP_HOST_RELAY
++        MENUITEM "Copy Host Address", ID_M_RETROPVP_COPY_HOST_ADDRESS
++        MENUITEM "Join Game...", ID_M_RETROPVP_JOIN
++        MENUITEM "Disconnect", ID_M_RETROPVP_DISCONNECT
++        MENUITEM SEPARATOR
++        MENUITEM "Player 1 Keys...", ID_M_RETROPVP_P1_KEYS
++        MENUITEM "Player 2 Keys...", ID_M_RETROPVP_P2_KEYS
++        MENUITEM "Emulator Hotkeys...", ID_M_RETROPVP_HOTKEYS
++        MENUITEM "Volume...", ID_M_RETROPVP_VOLUME
++        MENUITEM "Relay Region...", ID_M_RETROPVP_RELAY
++    }
+     POPUP "Window"
+     {
+         POPUP "Windowed Scale"
+@@ -92,6 +102,127 @@ FONT 8, "Ms Shell Dlg"
+     LTEXT           "Please select a core to use for the content loaded.\nOtherwise, press 'Cancel' to cancel loading.", 0, 9, 12, 160, 17, SS_LEFT, WS_EX_LEFT
+ }
+ 
++IDD_RETROPVP_CONNECT DIALOG 0, 0, 230, 64
++STYLE DS_MODALFRAME | DS_SETFONT | WS_CAPTION | WS_POPUP | WS_SYSMENU
++CAPTION "Join RetroPvP Game"
++FONT 8, "MS Shell Dlg"
++{
++    LTEXT           "Host address", -1, 8, 11, 54, 10
++    EDITTEXT        IDC_RETROPVP_ADDRESS, 66, 8, 156, 14, ES_AUTOHSCROLL | WS_TABSTOP
++    DEFPUSHBUTTON   "Join", IDOK, 114, 40, 50, 14
++    PUSHBUTTON      "Cancel", IDCANCEL, 170, 40, 50, 14
++}
++
++IDD_RETROPVP_P1_KEYS DIALOG 0, 0, 220, 182
++STYLE DS_MODALFRAME | DS_SETFONT | WS_CAPTION | WS_POPUP | WS_SYSMENU
++CAPTION "Player 1 Keys"
++FONT 8, "MS Shell Dlg"
++{
++    LTEXT           "Up", -1, 8, 10, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_UP, 92, 8, 116, 14
++    LTEXT           "Down", -1, 8, 28, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_DOWN, 92, 26, 116, 14
++    LTEXT           "Left", -1, 8, 46, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_LEFT, 92, 44, 116, 14
++    LTEXT           "Right", -1, 8, 64, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_RIGHT, 92, 62, 116, 14
++    LTEXT           "A", -1, 8, 82, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_A, 92, 80, 116, 14
++    LTEXT           "B", -1, 8, 100, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_B, 92, 98, 116, 14
++    LTEXT           "Start", -1, 8, 118, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_START, 92, 116, 116, 14
++    LTEXT           "Select", -1, 8, 136, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_SELECT, 92, 134, 116, 14
++    DEFPUSHBUTTON   "Save", IDOK, 100, 158, 50, 14
++    PUSHBUTTON      "Cancel", IDCANCEL, 156, 158, 50, 14
++}
++
++IDD_RETROPVP_P2_KEYS DIALOG 0, 0, 220, 218
++STYLE DS_MODALFRAME | DS_SETFONT | WS_CAPTION | WS_POPUP | WS_SYSMENU
++CAPTION "Player 2 Keys"
++FONT 8, "MS Shell Dlg"
++{
++    LTEXT           "Up", -1, 8, 8, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_UP, 92, 6, 116, 14
++    LTEXT           "Down", -1, 8, 26, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_DOWN, 92, 24, 116, 14
++    LTEXT           "Left", -1, 8, 44, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_LEFT, 92, 42, 116, 14
++    LTEXT           "Right", -1, 8, 62, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_RIGHT, 92, 60, 116, 14
++    LTEXT           "A", -1, 8, 80, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_A, 92, 78, 116, 14
++    LTEXT           "B", -1, 8, 98, 64, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_B, 92, 96, 116, 14
++    LTEXT           "Previous target", -1, 8, 116, 80, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_L, 92, 114, 116, 14
++    LTEXT           "Next target", -1, 8, 134, 80, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_R, 92, 132, 116, 14
++    LTEXT           "Take over", -1, 8, 152, 80, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_X, 92, 150, 116, 14
++    LTEXT           "Spawn Bill", -1, 8, 170, 80, 12
++    PUSHBUTTON      "", IDC_RETROPVP_BIND_SELECT, 92, 168, 116, 14
++    DEFPUSHBUTTON   "Save", IDOK, 100, 192, 50, 14
++    PUSHBUTTON      "Cancel", IDCANCEL, 156, 192, 50, 14
++}
++
++IDD_RETROPVP_HOTKEYS DIALOG 0, 0, 250, 262
++STYLE DS_MODALFRAME | DS_SETFONT | WS_CAPTION | WS_POPUP | WS_SYSMENU
++CAPTION "Emulator Hotkeys"
++FONT 8, "MS Shell Dlg"
++{
++    LTEXT           "RetroArch menu", -1, 8, 8, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_MENU, 126, 6, 116, 14
++    LTEXT           "Pause", -1, 8, 26, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_PAUSE, 126, 24, 116, 14
++    LTEXT           "Save state", -1, 8, 44, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_SAVE, 126, 42, 116, 14
++    LTEXT           "Load state", -1, 8, 62, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_LOAD, 126, 60, 116, 14
++    LTEXT           "Previous state slot", -1, 8, 80, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_SLOT_PREV, 126, 78, 116, 14
++    LTEXT           "Next state slot", -1, 8, 98, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_SLOT_NEXT, 126, 96, 116, 14
++    LTEXT           "Screenshot", -1, 8, 116, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_SCREENSHOT, 126, 114, 116, 14
++    LTEXT           "Reset game", -1, 8, 134, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_RESET, 126, 132, 116, 14
++    LTEXT           "Mute", -1, 8, 152, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_MUTE, 126, 150, 116, 14
++    LTEXT           "Fullscreen", -1, 8, 170, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_FULLSCREEN, 126, 168, 116, 14
++    LTEXT           "Exit", -1, 8, 188, 106, 12
++    PUSHBUTTON      "", IDC_RETROPVP_HOTKEY_QUIT, 126, 186, 116, 14
++    DEFPUSHBUTTON   "Save", IDOK, 130, 230, 50, 14
++    PUSHBUTTON      "Cancel", IDCANCEL, 186, 230, 50, 14
++}
++
++IDD_RETROPVP_VOLUME DIALOG 0, 0, 230, 82
++STYLE DS_MODALFRAME | DS_SETFONT | WS_CAPTION | WS_POPUP | WS_SYSMENU
++CAPTION "Volume"
++FONT 8, "MS Shell Dlg"
++{
++    LTEXT           "Volume", -1, 8, 10, 64, 12
++    LTEXT           "", IDC_RETROPVP_VOLUME_VALUE, 174, 10, 46, 12, SS_RIGHT
++    CONTROL         "", IDC_RETROPVP_VOLUME_SLIDER, "SCROLLBAR", SBS_HORZ | WS_TABSTOP, 8, 30, 212, 16
++    DEFPUSHBUTTON   "Save", IDOK, 104, 58, 50, 14
++    PUSHBUTTON      "Cancel", IDCANCEL, 160, 58, 50, 14
++}
++
++IDD_RETROPVP_RELAY DIALOG 0, 0, 260, 118
++STYLE DS_MODALFRAME | DS_SETFONT | WS_CAPTION | WS_POPUP | WS_SYSMENU
++CAPTION "Relay Region"
++FONT 8, "MS Shell Dlg"
++{
++    LTEXT           "Region", -1, 8, 12, 74, 12
++    COMBOBOX        IDC_RETROPVP_RELAY_REGION, 92, 8, 160, 70, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
++    LTEXT           "Address or address|port", -1, 8, 38, 82, 18
++    EDITTEXT        IDC_RETROPVP_RELAY_CUSTOM, 92, 36, 160, 14, ES_AUTOHSCROLL | WS_TABSTOP
++    DEFPUSHBUTTON   "Save", IDOK, 136, 88, 50, 14
++    PUSHBUTTON      "Cancel", IDCANCEL, 192, 88, 50, 14
++}
++
+ //
+ // Icon resources
+ //
+diff --git a/ui/drivers/ui_win32_resource.h b/ui/drivers/ui_win32_resource.h
+index 1baed7a..6476545 100644
+--- a/ui/drivers/ui_win32_resource.h
++++ b/ui/drivers/ui_win32_resource.h
+@@ -2,6 +2,12 @@
+ #define IDR_MENU                                101
+ #define IDD_PICKCORE                            103
+ #define IDR_ACCELERATOR1                        104
++#define IDD_RETROPVP_CONNECT                    105
++#define IDD_RETROPVP_P1_KEYS                    106
++#define IDD_RETROPVP_P2_KEYS                    107
++#define IDD_RETROPVP_HOTKEYS                    108
++#define IDD_RETROPVP_VOLUME                     109
++#define IDD_RETROPVP_RELAY                      110
+ #define ID_M_LOAD_CONTENT                       40001
+ #define ID_CORELISTBOX                          40002
+ #define ID_M_RESET                              40002
+@@ -40,3 +43,40 @@
+ #define ID_M_TAKE_SCREENSHOT                    40035
+ #define ID_M_MUTE_TOGGLE                        40036
+ #define ID_M_TOGGLE_DESKTOP                     40037
++#define ID_M_RETROPVP_HOST                      40038
++#define ID_M_RETROPVP_JOIN                      40039
++#define ID_M_RETROPVP_DISCONNECT                40040
++#define ID_M_RETROPVP_P1_KEYS                   40041
++#define ID_M_RETROPVP_P2_KEYS                   40042
++#define ID_M_RETROPVP_COPY_HOST_ADDRESS         40043
++#define ID_M_RETROPVP_HOST_RELAY                40044
++#define ID_M_RETROPVP_RELAY                     40045
++#define ID_M_RETROPVP_VOLUME                    40046
++#define ID_M_RETROPVP_HOTKEYS                   40047
++#define IDC_RETROPVP_ADDRESS                    41000
++#define IDC_RETROPVP_BIND_UP                    41001
++#define IDC_RETROPVP_BIND_DOWN                  41002
++#define IDC_RETROPVP_BIND_LEFT                  41003
++#define IDC_RETROPVP_BIND_RIGHT                 41004
++#define IDC_RETROPVP_BIND_A                     41005
++#define IDC_RETROPVP_BIND_B                     41006
++#define IDC_RETROPVP_BIND_START                 41007
++#define IDC_RETROPVP_BIND_SELECT                41008
++#define IDC_RETROPVP_BIND_L                     41009
++#define IDC_RETROPVP_BIND_R                     41010
++#define IDC_RETROPVP_BIND_X                     41011
++#define IDC_RETROPVP_HOTKEY_MENU                41012
++#define IDC_RETROPVP_HOTKEY_PAUSE               41013
++#define IDC_RETROPVP_HOTKEY_SAVE                41014
++#define IDC_RETROPVP_HOTKEY_LOAD                41015
++#define IDC_RETROPVP_HOTKEY_SLOT_PREV            41016
++#define IDC_RETROPVP_HOTKEY_SLOT_NEXT            41017
++#define IDC_RETROPVP_HOTKEY_SCREENSHOT           41018
++#define IDC_RETROPVP_HOTKEY_RESET                41019
++#define IDC_RETROPVP_HOTKEY_MUTE                 41020
++#define IDC_RETROPVP_HOTKEY_FULLSCREEN           41021
++#define IDC_RETROPVP_HOTKEY_QUIT                 41022
++#define IDC_RETROPVP_VOLUME_SLIDER               41023
++#define IDC_RETROPVP_VOLUME_VALUE                41024
++#define IDC_RETROPVP_RELAY_REGION                41025
++#define IDC_RETROPVP_RELAY_CUSTOM                41026

@@ -1,0 +1,61 @@
+{
+  "profile_id": "smb1-world-headered",
+  "sha1": "33d23c2f2cfa4c9efec87f7bc1321ce3ce6c89bd",
+  "rom_size": 40976,
+  "memory": {
+    "enemy_flag": 15,
+    "enemy_id": 22,
+    "enemy_state": 30,
+    "enemy_moving_direction": 70,
+    "enemy_x_speed": 88,
+    "enemy_page": 110,
+    "enemy_x": 135,
+    "enemy_y_high": 182,
+    "enemy_y": 207,
+    "player_y": 206,
+    "enemy_bounding_box": 1178,
+    "screen_left_page": 1818,
+    "screen_left_x": 1820,
+    "screen_right_page": 1819,
+    "screen_right_x": 1821,
+    "operation_mode": 1904,
+    "game_mode_value": 1,
+    "pause_status": 1910,
+    "director_state": 1737
+  },
+  "bullet_bill": {
+    "cannon_variant_id": 51,
+    "frenzy_variant_id": 8,
+    "slots": 5,
+    "controllable_slots": 3,
+    "bounding_box_value": 9,
+    "spawn_inset": 8,
+    "height_min": 48,
+    "height_max": 192,
+    "height_step_frames": 1,
+    "speed_slow": 240,
+    "speed_default": 232,
+    "speed_fast": 224,
+    "left_direction": 2,
+    "vertical_high_position": 1,
+    "defeated_state_mask": 32
+  },
+  "enemy_control": {
+    "horizontal_enemies": [
+      { "id": 0, "label": "GREEN KOOPA" },
+      { "id": 2, "label": "BUZZY BEETLE" },
+      { "id": 3, "label": "RED KOOPA" },
+      { "id": 6, "label": "GOOMBA" }
+    ]
+  },
+  "controls": {
+    "spawn": "P2 Select",
+    "previous_target": "L shoulder",
+    "next_target": "R shoulder",
+    "takeover_toggle": "X",
+    "action_a": "P2 A",
+    "action_b": "P2 B",
+    "height": "D-pad up/down",
+    "speed": "D-pad left accelerates; right slows"
+  }
+}

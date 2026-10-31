@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible RetroPvP issue
+title: "[Bug]: "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: RetroPvP revision
+      description: Commit or package version, if known.
+    validations:
+      required: false
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Windows version, core revision, connection mode, and whether both peers use identical content.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log excerpt
+      description: Remove usernames, addresses, relay invites, and other private details before posting.
+    validations:
+      required: false

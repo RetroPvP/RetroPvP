@@ -1,0 +1,2 @@
+url=https://github.com/libretro/MesenCE.git
+commit=4c4e069f16a8ad6ed79e046046c56d51558c7daf
