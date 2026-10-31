@@ -2,6 +2,8 @@
 
 RetroPvP is a Windows x64 proof of concept for asymmetric *Super Mario Bros.* Netplay: Player 1 plays Mario while Player 2 takes over supported enemies or spawns and steers a Bullet Bill.
 
+**Download:** [RetroPvP 0.1.0-alpha.1 for Windows x64](https://github.com/RetroPvP/RetroPvP/releases/tag/v0.1.0-alpha.1). The release contains no game ROM; choose your own matching copy when the launcher asks for it.
+
 ## Supported game
 
 The current profile supports one specific headered SMB1 ROM image. The core checks its SHA-1 against [`config/games/smb1.json`](config/games/smb1.json) and leaves the director inactive for other images. No ROM is included. Each player must supply their own legally obtained copy; do not commit ROMs, save files, or tester packages containing a ROM.

@@ -11,7 +11,7 @@ $portableRom = Join-Path $projectRoot 'roms\smb.nes'
 $portableMode = Test-Path -LiteralPath $portableRuntime -PathType Container
 
 if ($portableMode) {
-    foreach ($requiredFile in @((Join-Path $portableRuntime 'retroarch.exe'), $portableCore, $portableRom)) {
+    foreach ($requiredFile in @((Join-Path $portableRuntime 'retroarch.exe'), $portableCore)) {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
             throw "Portable package file is missing: $requiredFile"
         }
@@ -19,7 +19,7 @@ if ($portableMode) {
     $retroArchRuntime = $portableRuntime
     $retroArch = Join-Path $retroArchRuntime 'retroarch.exe'
     $core = $portableCore
-    if ([string]::IsNullOrWhiteSpace($RomPath)) {
+    if ([string]::IsNullOrWhiteSpace($RomPath) -and (Test-Path -LiteralPath $portableRom -PathType Leaf)) {
         $RomPath = $portableRom
     }
 } else {
@@ -39,17 +39,19 @@ if ($portableMode) {
         $preferredRom = Join-Path $projectRoot 'roms\smb.nes'
         if (Test-Path -LiteralPath $preferredRom) {
             $RomPath = $preferredRom
-        } else {
-            Add-Type -AssemblyName System.Windows.Forms
-            $dialog = New-Object System.Windows.Forms.OpenFileDialog
-            $dialog.Title = 'Select the supported SMB1 ROM'
-            $dialog.Filter = 'NES ROMs (*.nes;*.unf;*.unif)|*.nes;*.unf;*.unif|All files (*.*)|*.*'
-            if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
-                return
-            }
-            $RomPath = $dialog.FileName
         }
     }
+}
+
+if ([string]::IsNullOrWhiteSpace($RomPath)) {
+    Add-Type -AssemblyName System.Windows.Forms
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Select the supported SMB1 ROM'
+    $dialog.Filter = 'NES ROMs (*.nes;*.unf;*.unif)|*.nes;*.unf;*.unif|All files (*.*)|*.*'
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        return
+    }
+    $RomPath = $dialog.FileName
 }
 
 if (-not (Test-Path -LiteralPath $RomPath -PathType Leaf)) {

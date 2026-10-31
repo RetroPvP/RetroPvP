@@ -32,4 +32,10 @@ The headless checks run without opening the emulator. They still require the loc
 
 tools/package-retropvp.ps1 creates a Windows tester ZIP from the local build and the ROM you select or pass with -RomPath. The ROM is copied into that local ZIP. The script does not upload it. Do not commit the ZIP or distribute it unless you have the rights to distribute the included game data.
 
+To create a portable release archive without a ROM, run:
+
+    .\tools\package-retropvp.ps1 -NoRom -OutputPath ".\build\releases\RetroPvP-0.1.0-alpha.1-win-x64.zip"
+
+The release bundle includes the patched frontend, core, required menu assets, and license texts. It opens a file picker if `roms\smb.nes` is absent and verifies that the archive contains no ROM or save files. Publish the archive only after building the frontend and core from the pinned revisions.
+
 Build output, upstream source checkouts, RetroArch user settings, saves, and states are local-only and ignored by Git.
